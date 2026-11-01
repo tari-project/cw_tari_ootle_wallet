@@ -23,10 +23,17 @@ use ootle_rs::{
 };
 use tari_crypto::tari_utilities::ByteArray;
 use tari_crypto::{keys::PublicKey, ristretto::RistrettoPublicKey};
-use tari_ootle_common_types::engine_types::{substate::SubstateId, Utxo};
+use tari_ootle_common_types::{
+    engine_types::{
+        substate::{Substate, SubstateId},
+        Utxo,
+    },
+    shard::Shard,
+    StateVersion,
+};
 
 use super::{
-    store::{now_ms, OutputStatus, OwnedOutput, TxKind, TxRecord, TxState},
+    store::{now_ms, OutputStatus, OwnedOutput, Store, TxKind, TxRecord, TxState},
     wallet::{Provider, Wallet},
 };
 
@@ -113,48 +120,114 @@ async fn pass(wallet: &Wallet, provider: &Provider) -> anyhow::Result<bool> {
     }
 
     let found = recover(wallet, provider, &candidates).await?;
+    let verified_spent = verify_spent_outputs(wallet, provider, &spent).await?;
+    let next_cursor = cursor.to_pairs();
 
-    wallet.write(|s| {
-        for (id, output) in found {
-            if s.outputs.contains_key(&id) {
-                continue;
-            }
-            // Change and claim/faucet outputs come from our own transactions; only the rest is income.
-            if !s.own_outputs.remove(&id) {
-                s.transactions.push(TxRecord {
-                    id: id.clone(),
-                    kind: TxKind::Received,
-                    amount: output.value,
-                    fee: 0,
-                    state: TxState::Completed,
-                    counterparty: None,
-                    memo: output.memo.clone(),
-                    error: None,
-                    max_epoch: None,
-                    created_at_ms: output.found_at_ms,
-                });
-            }
-            s.outputs.insert(id, output);
-        }
-        let spent: HashSet<String> = spent.iter().map(UtxoId::to_string).collect();
-        let mut settled = HashSet::new();
-        for (_, o) in s.outputs.iter_mut().filter(|(id, _)| spent.contains(*id)) {
-            if let Some(tx) = o.locked_by.take() {
-                settled.insert(tx);
-            }
-            o.status = OutputStatus::Spent;
-        }
-        // An input of a send we lost track of (app killed mid-watch) was spent, so the send landed.
-        for tx in settled {
-            if let Some(t) = s.tx_mut(&tx) {
-                if t.state == TxState::Pending {
-                    t.state = TxState::Completed;
-                }
-            }
-        }
-        s.cursor = cursor.to_pairs();
-    })?;
+    wallet.write(|s| apply_scan_pass(s, found, &verified_spent, next_cursor))?;
     Ok(has_more)
+}
+
+/// Applies verified unspent recoveries and verified spent/burnt transitions to the wallet store.
+fn apply_scan_pass(
+    s: &mut Store,
+    found: Vec<(String, OwnedOutput)>,
+    verified_spent: &HashSet<String>,
+    cursor: Vec<(Shard, StateVersion)>,
+) {
+    for (id, output) in found {
+        let already_recorded = s.outputs.contains_key(&id);
+        if s.outputs
+            .get(&id)
+            .is_some_and(|o| o.status != OutputStatus::Spent)
+        {
+            continue;
+        }
+        // Change and claim/faucet outputs come from our own transactions; only the rest is income.
+        // If an output was previously known (e.g., falsely marked Spent and re-verified), do not
+        // push a duplicate Received transaction entry.
+        if !already_recorded && !s.own_outputs.remove(&id) {
+            s.transactions.push(TxRecord {
+                id: id.clone(),
+                kind: TxKind::Received,
+                amount: output.value,
+                fee: 0,
+                state: TxState::Completed,
+                counterparty: None,
+                memo: output.memo.clone(),
+                error: None,
+                max_epoch: None,
+                created_at_ms: output.found_at_ms,
+            });
+        }
+        s.outputs.insert(id, output);
+    }
+    let mut settled = HashSet::new();
+    for (_, o) in s
+        .outputs
+        .iter_mut()
+        .filter(|(id, _)| verified_spent.contains(*id))
+    {
+        if let Some(tx) = o.locked_by.take() {
+            settled.insert(tx);
+        }
+        o.status = OutputStatus::Spent;
+    }
+    // An input of a send we lost track of (app killed mid-watch) was spent, so the send landed.
+    for tx in settled {
+        if let Some(t) = s.tx_mut(&tx) {
+            if t.state == TxState::Pending {
+                t.state = TxState::Completed;
+            }
+        }
+    }
+    s.cursor = cursor;
+}
+
+/// Returns true only when the verified substate lookup confirms the UTXO no longer holds an
+/// unspent output (either the substate is absent/downed or the UTXO record has no output).
+fn is_substate_spent(substate: Option<&Substate>) -> bool {
+    match substate {
+        None => true,
+        Some(substate) => substate
+            .substate_value()
+            .as_utxo()
+            .is_none_or(|utxo| utxo.output().is_none()),
+    }
+}
+
+/// `watch_stealth_utxos` is served unproven by the indexer. Before marking any of our live outputs
+/// `Spent` (or settling a pending outgoing transaction that locked them), re-read each candidate
+/// through `provider.get_substate` under `IndexerTrust::Verify`.
+async fn verify_spent_outputs(
+    wallet: &Wallet,
+    provider: &Provider,
+    spent_candidates: &[UtxoId],
+) -> anyhow::Result<HashSet<String>> {
+    let tracked_live: HashSet<String> = wallet.read(|s| {
+        s.outputs
+            .iter()
+            .filter(|(_, o)| o.status != OutputStatus::Spent)
+            .map(|(id, _)| id.clone())
+            .collect()
+    });
+    let mut verified = HashSet::new();
+    let mut seen = HashSet::new();
+    for id in spent_candidates {
+        let id_str = id.to_string();
+        if !tracked_live.contains(&id_str) || !seen.insert(id_str.clone()) {
+            continue;
+        }
+        let substate_id = SubstateId::from(UtxoAddress::new(TARI_TOKEN, *id));
+        let substate = provider.get_substate(substate_id).await?;
+        if is_substate_spent(substate.as_ref()) {
+            verified.insert(id_str);
+        } else {
+            warn!(
+                "Ignoring unproven Spent/Burnt frame for UTXO {id_str}: verified substate is still unspent"
+            );
+        }
+    }
+    Ok(verified)
 }
 
 /// Fetch the matched outputs, re-read each through the verifying provider, and keep the ones this
@@ -169,7 +242,11 @@ async fn recover(
 ) -> anyhow::Result<Vec<(String, OwnedOutput)>> {
     let mut found = Vec::new();
     for (id, _) in provider.fetch_unspent_utxos(TARI_TOKEN, candidates).await? {
-        if wallet.read(|s| s.outputs.contains_key(&id.to_string())) {
+        if wallet.read(|s| {
+            s.outputs
+                .get(&id.to_string())
+                .is_some_and(|o| o.status != OutputStatus::Spent)
+        }) {
             continue;
         }
         // fetch_unspent_utxos is served unproven; get_substate verifies under IndexerTrust::Verify.
@@ -253,4 +330,86 @@ async fn expire_stale_sends(wallet: &Wallet, provider: &Provider) -> anyhow::Res
             );
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_output(value: u64, status: OutputStatus, locked_by: Option<&str>) -> OwnedOutput {
+        OwnedOutput {
+            value,
+            status,
+            locked_by: locked_by.map(str::to_string),
+            memo: Some("memo".into()),
+            found_at_ms: 1234,
+        }
+    }
+
+    #[test]
+    fn unverified_spent_frames_do_not_spend_outputs_or_complete_pending_sends() {
+        let mut store = Store::default();
+        store.outputs.insert(
+            "utxo_1".into(),
+            sample_output(5_000_000, OutputStatus::Locked, Some("tx_1")),
+        );
+        store.transactions.push(TxRecord {
+            id: "tx_1".into(),
+            kind: TxKind::Sent,
+            amount: 1_000_000,
+            fee: 500,
+            state: TxState::Pending,
+            counterparty: Some("dest".into()),
+            memo: None,
+            error: None,
+            max_epoch: Some(10),
+            created_at_ms: 1000,
+        });
+
+        // When verify_spent_outputs rejects an unproven Spent frame because the UTXO is still
+        // live on-chain, `verified_spent` is empty.
+        let verified_spent = HashSet::new();
+        apply_scan_pass(&mut store, Vec::new(), &verified_spent, Vec::new());
+
+        assert_eq!(store.outputs["utxo_1"].status, OutputStatus::Locked);
+        assert_eq!(store.outputs["utxo_1"].locked_by.as_deref(), Some("tx_1"));
+        assert_eq!(store.transactions[0].state, TxState::Pending);
+        assert_eq!(store.balance().locked, 5_000_000);
+    }
+
+    #[test]
+    fn apply_scan_pass_recovers_falsely_spent_output_without_duplicating_history() {
+        let mut store = Store::default();
+        store.outputs.insert(
+            "utxo_1".into(),
+            sample_output(2_500_000, OutputStatus::Spent, None),
+        );
+        store.transactions.push(TxRecord {
+            id: "utxo_1".into(),
+            kind: TxKind::Received,
+            amount: 2_500_000,
+            fee: 0,
+            state: TxState::Completed,
+            counterparty: None,
+            memo: Some("memo".into()),
+            error: None,
+            max_epoch: None,
+            created_at_ms: 1234,
+        });
+
+        // Re-verifying the unspent UTXO restores it to Unspent without adding a second Received tx.
+        apply_scan_pass(
+            &mut store,
+            vec![(
+                "utxo_1".into(),
+                sample_output(2_500_000, OutputStatus::Unspent, None),
+            )],
+            &HashSet::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(store.outputs["utxo_1"].status, OutputStatus::Unspent);
+        assert_eq!(store.balance().available, 2_500_000);
+        assert_eq!(store.transactions.len(), 1);
+    }
 }
