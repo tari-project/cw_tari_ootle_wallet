@@ -7,8 +7,8 @@ use crate::{
     api::send::SendEvent,
     domain::{
         burn_proof::BurnProof,
-        send,
-        store::{now_ms, ClaimRecord, ClaimState},
+        send::{self, ClaimOutcome},
+        store::{now_ms, ClaimRecord, ClaimState, Store},
         wallet::Wallet,
     },
     frb_generated::StreamSink,
@@ -78,21 +78,65 @@ pub fn get_claims(name: String) -> anyhow::Result<Vec<ClaimDto>> {
     Ok(Wallet::get(&name)?.read(|s| s.claims.iter().map(dto).collect()))
 }
 
-/// Submits the claim and streams until it lands. A failure leaves the claim pending to retry.
+fn playable_claim_proof_json(store: &Store, claim_id: &str) -> anyhow::Result<String> {
+    let c = store
+        .claims
+        .iter()
+        .find(|c| c.id == claim_id)
+        .ok_or_else(|| anyhow::anyhow!("no claim {claim_id}"))?;
+    match c.state {
+        ClaimState::Claimed => anyhow::bail!("claim {claim_id} has already been claimed"),
+        ClaimState::Submitted => {
+            anyhow::bail!(
+                "claim {claim_id} has already been submitted and is awaiting confirmation"
+            )
+        }
+        ClaimState::Pending => Ok(c.proof_json.clone()),
+    }
+}
+
+fn apply_claim_result(
+    store: &mut Store,
+    claim_id: &str,
+    result: Result<ClaimOutcome, String>,
+) -> SendEvent {
+    match result {
+        Ok(ClaimOutcome::Committed { tx_id }) => {
+            if let Some(c) = store.claims.iter_mut().find(|c| c.id == claim_id) {
+                c.state = ClaimState::Claimed;
+                c.tx_id = Some(tx_id.clone());
+                c.last_error = None;
+            }
+            SendEvent::Completed { tx_id }
+        }
+        Ok(ClaimOutcome::WatchFailed { tx_id, error }) => {
+            if let Some(c) = store.claims.iter_mut().find(|c| c.id == claim_id) {
+                c.state = ClaimState::Submitted;
+                c.tx_id = Some(tx_id);
+                c.last_error = Some(error.clone());
+            }
+            SendEvent::Failed { message: error }
+        }
+        Err(message) => {
+            if let Some(c) = store.claims.iter_mut().find(|c| c.id == claim_id) {
+                c.state = ClaimState::Pending;
+                c.tx_id = None;
+                c.last_error = Some(message.clone());
+            }
+            SendEvent::Failed { message }
+        }
+    }
+}
+
+/// Submits the claim and streams until it lands. A pre-broadcast or on-chain rejection leaves the
+/// claim pending to retry; a post-broadcast watch disconnect keeps it in `Submitted`.
 pub async fn claim_burn(
     sink: StreamSink<SendEvent>,
     name: String,
     claim_id: String,
 ) -> anyhow::Result<()> {
     let wallet = Wallet::get(&name)?;
-    let proof_json = wallet
-        .read(|s| {
-            s.claims
-                .iter()
-                .find(|c| c.id == claim_id)
-                .map(|c| c.proof_json.clone())
-        })
-        .ok_or_else(|| anyhow::anyhow!("no claim {claim_id}"))?;
+    let proof_json = wallet.read(|s| playable_claim_proof_json(s, &claim_id))?;
     let proof = BurnProof::from_json(&proof_json)?;
     let set = |state: ClaimState, tx_id: Option<String>, error: Option<String>| {
         wallet.write(|s| {
@@ -109,17 +153,62 @@ pub async fn claim_burn(
             let _ = sink.add(SendEvent::Submitted { tx_id });
         }
     })
-    .await;
-    match result {
-        Ok(tx_id) => {
-            set(ClaimState::Claimed, Some(tx_id.clone()), None)?;
-            let _ = sink.add(SendEvent::Completed { tx_id });
-        }
-        Err(e) => {
-            let message = format!("{e:#}");
-            set(ClaimState::Pending, None, Some(message.clone()))?;
-            let _ = sink.add(SendEvent::Failed { message });
+    .await
+    .map_err(|e| format!("{e:#}"));
+    let event = wallet.write(|s| apply_claim_result(s, &claim_id, result))?;
+    let _ = sink.add(event);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_claim(state: ClaimState) -> ClaimRecord {
+        ClaimRecord {
+            id: "c1".into(),
+            value: 1_000,
+            mined_in_epoch: 5,
+            proof_json: "{}".into(),
+            state,
+            tx_id: None,
+            last_error: None,
+            created_at_ms: 0,
         }
     }
-    Ok(())
+
+    #[test]
+    fn duplicate_claim_is_rejected_when_submitted_or_claimed() {
+        let mut store = Store::default();
+        store.claims.push(sample_claim(ClaimState::Submitted));
+        assert!(playable_claim_proof_json(&store, "c1").is_err());
+
+        store.claims[0].state = ClaimState::Claimed;
+        assert!(playable_claim_proof_json(&store, "c1").is_err());
+
+        store.claims[0].state = ClaimState::Pending;
+        assert_eq!(playable_claim_proof_json(&store, "c1").unwrap(), "{}");
+    }
+
+    #[test]
+    fn post_broadcast_watch_failure_preserves_submitted_state_and_tx_id() {
+        let mut store = Store::default();
+        store.claims.push(sample_claim(ClaimState::Submitted));
+
+        let event = apply_claim_result(
+            &mut store,
+            "c1",
+            Ok(ClaimOutcome::WatchFailed {
+                tx_id: "tx_abc".into(),
+                error: "watch timed out".into(),
+            }),
+        );
+        assert!(matches!(event, SendEvent::Failed { .. }));
+        assert_eq!(store.claims[0].state, ClaimState::Submitted);
+        assert_eq!(store.claims[0].tx_id.as_deref(), Some("tx_abc"));
+        assert_eq!(
+            store.claims[0].last_error.as_deref(),
+            Some("watch timed out")
+        );
+    }
 }

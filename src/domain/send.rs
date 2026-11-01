@@ -270,12 +270,23 @@ async fn await_commit(pending: ootle_rs::provider::PendingTransaction) -> anyhow
     }
 }
 
-/// Claims an L1 burn into this account as a stealth output. Returns the transaction id.
+pub(crate) enum ClaimOutcome {
+    Committed {
+        tx_id: String,
+    },
+    /// Broadcast succeeded, but the finality watch stream dropped or timed out before a verdict.
+    WatchFailed {
+        tx_id: String,
+        error: String,
+    },
+}
+
+/// Claims an L1 burn into this account as a stealth output.
 pub(crate) async fn claim(
     wallet: &Wallet,
     proof: BurnProof,
     on_progress: impl Fn(Progress),
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ClaimOutcome> {
     let mut provider = wallet.provider().await?;
     let build = |fee: u64| {
         let provider = &provider;
@@ -299,8 +310,16 @@ pub(crate) async fn claim(
     on_progress(Progress::Submitted {
         tx_id: tx_id.clone(),
     });
-    await_commit(pending).await?;
-    Ok(tx_id)
+    match pending.watch().await {
+        Ok(TransactionOutcome::Commit) => Ok(ClaimOutcome::Committed { tx_id }),
+        Ok(TransactionOutcome::OnlyFeeCommit(reason) | TransactionOutcome::Reject(reason)) => {
+            bail!("Transaction {tx_id} failed: {reason}")
+        }
+        Err(e) => Ok(ClaimOutcome::WatchFailed {
+            tx_id,
+            error: e.to_string(),
+        }),
+    }
 }
 
 /// Esmeralda only: takes the faucet's TARI into the account and moves 500 of it into a stealth

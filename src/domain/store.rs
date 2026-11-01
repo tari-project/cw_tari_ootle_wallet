@@ -86,6 +86,8 @@ pub(crate) struct ClaimRecord {
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct Store {
+    #[serde(default)]
+    pub address: Option<String>,
     pub birthday_epoch: u64,
     /// Per-shard scan cursor; empty until the first scan.
     pub cursor: Vec<(Shard, StateVersion)>,

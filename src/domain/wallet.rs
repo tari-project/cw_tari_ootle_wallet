@@ -39,11 +39,27 @@ impl Wallet {
         indexer_url: String,
         birthday_epoch: u64,
     ) -> anyhow::Result<Arc<Wallet>> {
+        let address = keys.address();
+        let address_str = address.to_string();
         let store_path = PathBuf::from(data_dir).join(format!("{name}.ootle.json"));
         let store = match Store::load(&store_path)? {
-            Some(s) => s,
+            Some(mut s) => {
+                if let Some(existing) = s.address.as_deref() {
+                    if existing != address_str {
+                        anyhow::bail!(
+                            "wallet store '{}' belongs to address {existing}, not {address_str}",
+                            store_path.display()
+                        );
+                    }
+                } else {
+                    s.address = Some(address_str);
+                    s.save(&store_path)?;
+                }
+                s
+            }
             None => {
                 let s = Store {
+                    address: Some(address_str),
                     birthday_epoch,
                     ..Store::default()
                 };
@@ -52,7 +68,7 @@ impl Wallet {
             }
         };
         let wallet = Arc::new(Wallet {
-            address: keys.address(),
+            address,
             keys,
             store_path,
             store: Mutex::new(store),
@@ -124,4 +140,59 @@ impl Wallet {
 /// whole mutation, so carrying on with what is in memory is safe.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use ootle_rs::Network;
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+
+    use super::*;
+
+    #[test]
+    fn open_rejects_mismatched_account_or_network_on_existing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let seed_a = CipherSeed::random();
+        let seed_b = CipherSeed::random();
+
+        let keys_a = AccountKeys::from_seed(&seed_a, Network::Esmeralda, 0);
+        Wallet::open(
+            "test-wallet",
+            data_dir,
+            keys_a,
+            "http://127.0.0.1:1".into(),
+            0,
+        )
+        .unwrap();
+        Wallet::close("test-wallet");
+
+        // Re-opening the same wallet store with a different seed must fail.
+        let keys_b = AccountKeys::from_seed(&seed_b, Network::Esmeralda, 0);
+        let err = Wallet::open(
+            "test-wallet",
+            data_dir,
+            keys_b,
+            "http://127.0.0.1:1".into(),
+            0,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("belongs to address"), "{err}");
+
+        // Re-opening the same seed on a different network must also fail.
+        let keys_mainnet = AccountKeys::from_seed(&seed_a, Network::MainNet, 0);
+        let err = Wallet::open(
+            "test-wallet",
+            data_dir,
+            keys_mainnet,
+            "http://127.0.0.1:1".into(),
+            0,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("belongs to address"), "{err}");
+    }
 }
