@@ -130,12 +130,33 @@ impl Store {
                 .values()
                 .filter(|o| o.status == s)
                 .map(|o| o.value)
-                .sum::<u64>()
+                .fold(0u64, u64::saturating_add)
         };
         Balance {
             available: sum(OutputStatus::Unspent),
             locked: sum(OutputStatus::Locked),
         }
+    }
+
+    /// Atomically verifies that all `inputs` are still `Unspent` and locks them to `tx_id`.
+    /// Prevents a concurrent send from overwriting `locked_by` on in-flight inputs and later
+    /// unlocking them when the second send fails.
+    pub fn lock_inputs(&mut self, inputs: &[String], tx_id: &str) -> anyhow::Result<()> {
+        for id in inputs {
+            let Some(output) = self.outputs.get(id) else {
+                anyhow::bail!("input output {id} is missing from wallet store");
+            };
+            if output.status != OutputStatus::Unspent || output.locked_by.is_some() {
+                anyhow::bail!("input output {id} is no longer unspent");
+            }
+        }
+        for id in inputs {
+            if let Some(o) = self.outputs.get_mut(id) {
+                o.status = OutputStatus::Locked;
+                o.locked_by = Some(tx_id.to_string());
+            }
+        }
+        Ok(())
     }
 
     pub fn has_live_outputs(&self) -> bool {
@@ -247,5 +268,45 @@ mod tests {
         let back = Store::load(&path).unwrap().unwrap();
         assert_eq!(back.birthday_epoch, 9);
         assert_eq!(back.outputs.len(), 1);
+    }
+
+    #[test]
+    fn lock_inputs_rejects_already_locked_utxo_without_stealing_lock() {
+        let mut s = Store::default();
+        s.outputs
+            .insert("a".into(), output(10, OutputStatus::Unspent, None));
+        s.outputs
+            .insert("b".into(), output(20, OutputStatus::Unspent, None));
+
+        s.lock_inputs(&["a".into()], "tx1").unwrap();
+        assert_eq!(s.outputs["a"].status, OutputStatus::Locked);
+        assert_eq!(s.outputs["a"].locked_by.as_deref(), Some("tx1"));
+
+        // A concurrent second send attempting to lock ["b", "a"] must fail atomically without
+        // locking "b" or overwriting "a"'s locked_by.
+        let err = s
+            .lock_inputs(&["b".into(), "a".into()], "tx2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer unspent"), "{err}");
+        assert_eq!(s.outputs["a"].locked_by.as_deref(), Some("tx1"));
+        assert_eq!(s.outputs["b"].status, OutputStatus::Unspent);
+
+        // If tx2 fails and settles, tx1's locked input remains locked.
+        s.settle("tx2", false, 0, Some("failed".into()));
+        assert_eq!(s.outputs["a"].status, OutputStatus::Locked);
+        assert_eq!(s.outputs["a"].locked_by.as_deref(), Some("tx1"));
+    }
+
+    #[test]
+    fn balance_saturates_on_overflow() {
+        let mut s = Store::default();
+        s.outputs.insert(
+            "a".into(),
+            output(u64::MAX - 5, OutputStatus::Unspent, None),
+        );
+        s.outputs
+            .insert("b".into(), output(100, OutputStatus::Unspent, None));
+        assert_eq!(s.balance().available, u64::MAX);
     }
 }

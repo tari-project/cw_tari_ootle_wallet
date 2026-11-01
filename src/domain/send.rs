@@ -50,15 +50,35 @@ where
         let run = provider
             .sign_and_send_dry_run_with(&authorizer, unsigned)
             .await?;
-        if run.finalize.charged_fees() <= fee {
+        if let Some(reason) = run.finalize.any_reject() {
+            if run.finalize.required_fees() <= fee {
+                bail!("Transaction dry run was rejected: {reason}");
+            }
+        } else if run.finalize.charged_fees() <= fee {
             return Ok(fee);
         }
-        fee = run.finalize.required_fees();
+        fee = run.finalize.required_fees().max(fee.saturating_add(1));
         if fee > MAX_FEE {
             bail!("The network asked for a fee of {fee} µT, over the {MAX_FEE} µT limit");
         }
     }
     bail!("The fee estimate did not settle after {MAX_FEE_ROUNDS} dry runs")
+}
+
+fn checked_target(amount: NonZeroU64, fee: u64) -> anyhow::Result<u64> {
+    amount.get().checked_add(fee).ok_or_else(|| {
+        anyhow!(
+            "send amount {} µT plus fee {fee} µT overflows u64",
+            amount.get()
+        )
+    })
+}
+
+fn checked_change(total: u64, amount: NonZeroU64, fee: u64) -> anyhow::Result<u64> {
+    let target = checked_target(amount, fee)?;
+    total
+        .checked_sub(target)
+        .ok_or_else(|| anyhow!("selected inputs total {total} µT is below required {target} µT"))
 }
 
 /// Largest outputs first, so the merged fee+transfer statement stays as small as it can.
@@ -105,8 +125,9 @@ async fn build_send<'p>(
     Vec<UtxoId>,
     Vec<String>,
 )> {
-    let (inputs, total) = select_inputs(wallet, amount.get().saturating_add(fee))?;
-    let change = total - amount.get() - fee;
+    let target = checked_target(amount, fee)?;
+    let (inputs, total) = select_inputs(wallet, target)?;
+    let change = checked_change(total, amount, fee)?;
     let mut recipient = Output::new(to.clone(), TARI_TOKEN, amount);
     if let Some(memo) = memo {
         recipient = recipient.with_memo_message(memo);
@@ -192,13 +213,9 @@ pub(crate) async fn send(
 
     // Lock before submitting: if the app dies after submit, the scan still knows these were ours to
     // settle, and expire_stale_sends releases them if the send never lands.
-    wallet.write(|s| {
-        for id in &inputs {
-            if let Some(o) = s.outputs.get_mut(&id.to_string()) {
-                o.status = OutputStatus::Locked;
-                o.locked_by = Some(tx_id.clone());
-            }
-        }
+    let input_ids: Vec<String> = inputs.iter().map(UtxoId::to_string).collect();
+    wallet.write(|s| -> anyhow::Result<()> {
+        s.lock_inputs(&input_ids, &tx_id)?;
         s.own_outputs.extend(change_ids);
         s.transactions.push(TxRecord {
             id: tx_id.clone(),
@@ -212,7 +229,8 @@ pub(crate) async fn send(
             max_epoch,
             created_at_ms: now_ms(),
         });
-    })?;
+        Ok(())
+    })??;
 
     let pending = match provider.send_transaction(tx).await {
         Ok(p) => p,
@@ -343,4 +361,21 @@ pub(crate) async fn faucet(wallet: &Wallet) -> anyhow::Result<String> {
     let tx_id = tx.calculate_id().to_string();
     await_commit(provider.send_transaction(tx).await?).await?;
     Ok(tx_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_target_and_change_reject_overflow_and_underflow() {
+        let max_amount = NonZeroU64::new(u64::MAX).unwrap();
+        assert!(checked_target(max_amount, 1).is_err());
+        assert!(checked_change(u64::MAX, max_amount, 1).is_err());
+
+        let amount = NonZeroU64::new(1_000).unwrap();
+        assert_eq!(checked_target(amount, 250).unwrap(), 1_250);
+        assert_eq!(checked_change(2_000, amount, 250).unwrap(), 750);
+        assert!(checked_change(1_200, amount, 250).is_err());
+    }
 }
