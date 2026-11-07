@@ -92,13 +92,22 @@ pub struct WalletInfo {
 }
 
 pub fn open_wallet(req: OpenWalletRequest) -> anyhow::Result<WalletInfo> {
+    if req.name.trim().is_empty() {
+        anyhow::bail!("wallet name cannot be empty");
+    }
+    if req.data_dir.trim().is_empty() {
+        anyhow::bail!("data_dir cannot be empty");
+    }
+    if req.indexer_url.trim().is_empty() {
+        anyhow::bail!("indexer_url cannot be empty");
+    }
     let keys = AccountKeys::from_words(&req.seed_words, req.network.into())?;
     let claim_public_key = keys.account_public_key().to_hex();
     let wallet = Wallet::open(
-        &req.name,
-        &req.data_dir,
+        req.name.trim(),
+        req.data_dir.trim(),
         keys,
-        req.indexer_url,
+        req.indexer_url.trim().to_string(),
         req.birthday_epoch,
     )?;
     Ok(WalletInfo {
@@ -113,6 +122,10 @@ pub fn close_wallet(name: String) {
 }
 
 pub fn set_indexer_url(name: String, indexer_url: String) -> anyhow::Result<()> {
-    Wallet::get(&name)?.set_indexer_url(indexer_url);
+    let trimmed = indexer_url.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("indexer_url cannot be empty");
+    }
+    Wallet::get(&name)?.set_indexer_url(trimmed.to_string());
     Ok(())
 }

@@ -44,6 +44,9 @@ impl BurnProof {
 }
 
 fn claim_proof_from_l1(proof: &BurnClaimProof) -> Result<MinotariBurnClaimProof, String> {
+    if proof.value == 0 {
+        return Err("burn proof value must be greater than zero".to_string());
+    }
     let BurnOutputProof {
         block_hash,
         output,
@@ -68,6 +71,12 @@ fn claim_proof_from_l1(proof: &BurnClaimProof) -> Result<MinotariBurnClaimProof,
     else {
         return Err("the burn output's sidechain feature is not a confidential output".to_string());
     };
+    if confidential_output.claim_public_key != proof.burn_public_key {
+        return Err(
+            "the burn proof's burn_public_key does not match the output's claim_public_key"
+                .to_string(),
+        );
+    }
     Ok(MinotariBurnClaimProof {
         commitment: output.commitment.to_byte_type(),
         ownership_proof: proof.ownership_proof.to_byte_type(),
@@ -160,9 +169,17 @@ mod tests {
 
     /// A Minotari burn proof file, as JSON, for an output with `features` (from upstream's tests).
     fn proof_file(features: &OutputFeatures) -> String {
+        let burn_public_key = features
+            .sidechain_feature
+            .as_ref()
+            .and_then(|sf| match &sf.data {
+                SideChainFeatureData::ConfidentialOutput(co) => Some(co.claim_public_key.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| public_key(1));
         serde_json::to_string(&CompleteClaimBurnProof {
             claim_proof: BurnClaimProof {
-                burn_public_key: public_key(1),
+                burn_public_key,
                 ownership_proof: Default::default(),
                 output_proof: BurnOutputProof {
                     block_hash: FixedHash::from([4u8; 32]),

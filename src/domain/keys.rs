@@ -56,8 +56,9 @@ impl AccountKeys {
 }
 
 pub(crate) fn parse_seed(seed_words: &str) -> anyhow::Result<CipherSeed> {
-    let words = SeedWords::from_str(seed_words.trim())
-        .map_err(|e| anyhow::anyhow!("invalid seed words: {e}"))?;
+    let normalized = seed_words.split_whitespace().collect::<Vec<_>>().join(" ");
+    let words =
+        SeedWords::from_str(&normalized).map_err(|e| anyhow::anyhow!("invalid seed words: {e}"))?;
     Ok(CipherSeed::from_mnemonic(&words, None)?)
 }
 
