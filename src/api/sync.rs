@@ -38,6 +38,7 @@ static SCANS: LazyLock<Mutex<HashMap<String, AbortHandle>>> = LazyLock::new(Defa
 /// Each pass is saved before its event fires, so stopping mid-scan loses nothing.
 pub async fn start_scan(sink: StreamSink<ScanEvent>, name: String) -> anyhow::Result<()> {
     let wallet = Wallet::get(&name)?;
+    let scan_name = name.clone();
     let task = tokio::spawn(async move {
         // A panic in a spawned task would otherwise just close the stream with no event.
         let result = AssertUnwindSafe(scan::scan(&wallet, |has_more| {
@@ -54,6 +55,10 @@ pub async fn start_scan(sink: StreamSink<ScanEvent>, name: String) -> anyhow::Re
                 message: format!("scan panicked: {}", panic_message(&*panic)),
             },
         });
+        let mut scans = SCANS.lock().unwrap_or_else(|e| e.into_inner());
+        if scans.get(&scan_name).is_some_and(AbortHandle::is_finished) {
+            scans.remove(&scan_name);
+        }
     });
     if let Some(old) = SCANS
         .lock()
